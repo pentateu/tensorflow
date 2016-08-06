@@ -1,4 +1,4 @@
-# Copyright 2016 Google Inc. All Rights Reserved.
+# Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,16 +22,22 @@ from __future__ import print_function
 import collections
 import csv
 
+import numpy as np
+
 from tensorflow.contrib.learn.python.learn.dataframe import dataframe as df
 from tensorflow.contrib.learn.python.learn.dataframe.transforms import batch
 from tensorflow.contrib.learn.python.learn.dataframe.transforms import csv_parser
 from tensorflow.contrib.learn.python.learn.dataframe.transforms import example_parser
+from tensorflow.contrib.learn.python.learn.dataframe.transforms import hashes
 from tensorflow.contrib.learn.python.learn.dataframe.transforms import in_memory_source
 from tensorflow.contrib.learn.python.learn.dataframe.transforms import reader_source
+from tensorflow.contrib.learn.python.learn.dataframe.transforms import sparsify
 from tensorflow.python.client import session as sess
+from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import errors
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import io_ops
+from tensorflow.python.ops import parsing_ops
 from tensorflow.python.ops import variables
 from tensorflow.python.platform import gfile
 from tensorflow.python.training import coordinator
@@ -49,6 +55,27 @@ def _expand_file_names(filepatterns):
   return list(filenames)
 
 
+def _dtype_to_nan(dtype):
+  if dtype is dtypes.string:
+    return b""
+  elif dtype.is_integer:
+    return np.nan
+  elif dtype.is_floating:
+    return np.nan
+  elif dtype is dtypes.bool:
+    return np.nan
+  else:
+    raise ValueError("Can't parse type without NaN into sparse tensor: %s" %
+                     dtype)
+
+
+def _get_default_value(feature_spec):
+  if isinstance(feature_spec, parsing_ops.FixedLenFeature):
+    return feature_spec.default_value
+  else:
+    return _dtype_to_nan(feature_spec.dtype)
+
+
 class TensorFlowDataFrame(df.DataFrame):
   """TensorFlowDataFrame implements convenience functions using TensorFlow."""
 
@@ -57,7 +84,8 @@ class TensorFlowDataFrame(df.DataFrame):
           graph=None,
           session=None,
           start_queues=True,
-          initialize_variables=True):
+          initialize_variables=True,
+          **kwargs):
     """Builds and runs the columns of the `DataFrame` and yields batches.
 
     This is a generator that yields a dictionary mapping column names to
@@ -71,6 +99,7 @@ class TensorFlowDataFrame(df.DataFrame):
       start_queues: if true, queues will be started before running and halted
         after producting `n` batches.
       initialize_variables: if true, variables will be initialized.
+      **kwargs: Additional keyword arguments e.g. `num_epochs`.
 
     Yields:
       A dictionary, mapping column names to the values resulting from running
@@ -81,7 +110,7 @@ class TensorFlowDataFrame(df.DataFrame):
     with graph.as_default():
       if session is None:
         session = sess.Session()
-      self_built = self.build()
+      self_built = self.build(**kwargs)
       keys = list(self_built.keys())
       cols = list(self_built.values())
       if initialize_variables:
@@ -103,6 +132,79 @@ class TensorFlowDataFrame(df.DataFrame):
       if start_queues:
         coord.request_stop()
         coord.join(threads)
+
+  def select_rows(self, boolean_series):
+    """Returns a `DataFrame` with only the rows indicated by `boolean_series`.
+
+    Note that batches may no longer have consistent size after calling
+    `select_rows`, so the new `DataFrame` may need to be rebatched.
+    For example:
+    '''
+    filtered_df = df.select_rows(df["country"] == "jp").batch(64)
+    '''
+
+    Args:
+      boolean_series: a `Series` that evaluates to a boolean `Tensor`.
+
+    Returns:
+      A new `DataFrame` with the same columns as `self`, but selecting only the
+      rows where `boolean_series` evaluated to `True`.
+    """
+    result = type(self)()
+    for key, col in self._columns.items():
+      try:
+        result[key] = col.select_rows(boolean_series)
+      except AttributeError as e:
+        raise NotImplementedError((
+            "The select_rows method is not implemented for Series type {}. "
+            "Original error: {}").format(type(col), e))
+    return result
+
+  def split(self, index_series, proportion, batch_size=None):
+    """Deterministically split a `DataFrame` into two `DataFrame`s.
+
+    Note this split is only as deterministic as the underlying hash function;
+    see `tf.string_to_hash_bucket_fast`.  The hash function is deterministic
+    for a given binary, but may change occasionally.  The only way to achieve
+    an absolute guarantee that the split `DataFrame`s do not change across runs
+    is to materialize them.
+
+    Note too that the allocation of a row to one partition or the
+    other is evaluated independently for each row, so the exact number of rows
+    in each partition is binomially distributed.
+
+    Args:
+      index_series: a `Series` of unique strings, whose hash will determine the
+        partitioning; or the name in this `DataFrame` of such a `Series`.
+        (This `Series` must contain strings because TensorFlow provides hash
+        ops only for strings, and there are no number-to-string converter ops.)
+      proportion: The proportion of the rows to select for the 'left'
+        partition; the remaining (1 - proportion) rows form the 'right'
+        partition.
+      batch_size: the batch size to use when rebatching the left and right
+        `DataFrame`s.  If None (default), the `DataFrame`s are not rebatched;
+        thus their batches will have variable sizes, according to which rows
+        are selected from each batch of the original `DataFrame`.
+
+    Returns:
+      Two `DataFrame`s containing the partitioned rows.
+    """
+    # TODO(soergel): allow seed?
+    if isinstance(index_series, str):
+      index_series = self[index_series]
+    num_buckets = 1000000  # close enough for simple splits
+    hashed_input, = hashes.HashFast(num_buckets)(index_series)
+    threshold = int(num_buckets * proportion)
+    left = hashed_input < threshold
+    right = ~left
+    left_rows = self.select_rows(left)
+    right_rows = self.select_rows(right)
+
+    if batch_size:
+      left_rows = left_rows.batch(batch_size=batch_size, shuffle=False)
+      right_rows = right_rows.batch(batch_size=batch_size, shuffle=False)
+
+    return left_rows, right_rows
 
   def run_once(self):
     """Creates a new 'Graph` and `Session` and runs a single batch.
@@ -154,20 +256,11 @@ class TensorFlowDataFrame(df.DataFrame):
     return dataframe
 
   @classmethod
-  def from_csv(cls,
-               filepatterns,
-               default_values,
-               has_header=True,
-               column_names=None,
-               num_epochs=None,
-               num_threads=1,
-               enqueue_size=None,
-               batch_size=32,
-               queue_capacity=None,
-               min_after_dequeue=None,
-               shuffle=True,
-               seed=None):
-    """Create a `DataFrame` from `tensorflow.Example`s.
+  def _from_csv_base(cls, filepatterns, get_default_values, has_header,
+                     column_names, num_threads, enqueue_size,
+                     batch_size, queue_capacity, min_after_dequeue, shuffle,
+                     seed):
+    """Create a `DataFrame` from CSV files.
 
     If `has_header` is false, then `column_names` must be specified. If
     `has_header` is true and `column_names` are specified, then `column_names`
@@ -175,12 +268,10 @@ class TensorFlowDataFrame(df.DataFrame):
 
     Args:
       filepatterns: a list of file patterns that resolve to CSV files.
-      default_values: a list of default values for each column.
+      get_default_values: a function that produces a list of default values for
+        each column, given the column names.
       has_header: whether or not the CSV files have headers.
       column_names: a list of names for the columns in the CSV files.
-      num_epochs: the number of times that the reader should loop through all
-        the file names. If set to `None`, then the reader will continue
-        indefinitely.
       num_threads: the number of readers that will work in parallel.
       enqueue_size: block size for each read operation.
       batch_size: desired batch size.
@@ -192,7 +283,7 @@ class TensorFlowDataFrame(df.DataFrame):
 
     Returns:
       A `DataFrame` that has columns corresponding to `features` and is filled
-      with `Example`s from `filepatterns`.
+      with examples from `filepatterns`.
 
     Raises:
       ValueError: no files match `filepatterns`.
@@ -212,13 +303,14 @@ class TensorFlowDataFrame(df.DataFrame):
       raise ValueError(
           "'index' is reserved and can not be used for a column name.")
 
+    default_values = get_default_values(column_names)
+
     reader_kwargs = {"skip_header_lines": (1 if has_header else 0)}
     index, value = reader_source.TextFileSource(
         filenames,
         reader_kwargs=reader_kwargs,
         enqueue_size=enqueue_size,
         batch_size=batch_size,
-        num_epochs=num_epochs,
         queue_capacity=queue_capacity,
         shuffle=shuffle,
         min_after_dequeue=min_after_dequeue,
@@ -235,11 +327,121 @@ class TensorFlowDataFrame(df.DataFrame):
     return dataframe
 
   @classmethod
+  def from_csv(cls,
+               filepatterns,
+               default_values,
+               has_header=True,
+               column_names=None,
+               num_threads=1,
+               enqueue_size=None,
+               batch_size=32,
+               queue_capacity=None,
+               min_after_dequeue=None,
+               shuffle=True,
+               seed=None):
+    """Create a `DataFrame` from CSV files.
+
+    If `has_header` is false, then `column_names` must be specified. If
+    `has_header` is true and `column_names` are specified, then `column_names`
+    overrides the names in the header.
+
+    Args:
+      filepatterns: a list of file patterns that resolve to CSV files.
+      default_values: a list of default values for each column.
+      has_header: whether or not the CSV files have headers.
+      column_names: a list of names for the columns in the CSV files.
+      num_threads: the number of readers that will work in parallel.
+      enqueue_size: block size for each read operation.
+      batch_size: desired batch size.
+      queue_capacity: capacity of the queue that will store parsed lines.
+      min_after_dequeue: minimum number of elements that can be left by a
+        dequeue operation. Only used if `shuffle` is true.
+      shuffle: whether records should be shuffled. Defaults to true.
+      seed: passed to random shuffle operations. Only used if `shuffle` is true.
+
+    Returns:
+      A `DataFrame` that has columns corresponding to `features` and is filled
+      with examples from `filepatterns`.
+
+    Raises:
+      ValueError: no files match `filepatterns`.
+      ValueError: `features` contains the reserved name 'index'.
+    """
+
+    def get_default_values(column_names):
+      # pylint: disable=unused-argument
+      return default_values
+
+    return cls._from_csv_base(filepatterns, get_default_values, has_header,
+                              column_names, num_threads,
+                              enqueue_size, batch_size, queue_capacity,
+                              min_after_dequeue, shuffle, seed)
+
+  @classmethod
+  def from_csv_with_feature_spec(cls,
+                                 filepatterns,
+                                 feature_spec,
+                                 has_header=True,
+                                 column_names=None,
+                                 num_threads=1,
+                                 enqueue_size=None,
+                                 batch_size=32,
+                                 queue_capacity=None,
+                                 min_after_dequeue=None,
+                                 shuffle=True,
+                                 seed=None):
+    """Create a `DataFrame` from CSV files, given a feature_spec.
+
+    If `has_header` is false, then `column_names` must be specified. If
+    `has_header` is true and `column_names` are specified, then `column_names`
+    overrides the names in the header.
+
+    Args:
+      filepatterns: a list of file patterns that resolve to CSV files.
+      feature_spec: a dict mapping column names to `FixedLenFeature` or
+          `VarLenFeature`.
+      has_header: whether or not the CSV files have headers.
+      column_names: a list of names for the columns in the CSV files.
+      num_threads: the number of readers that will work in parallel.
+      enqueue_size: block size for each read operation.
+      batch_size: desired batch size.
+      queue_capacity: capacity of the queue that will store parsed lines.
+      min_after_dequeue: minimum number of elements that can be left by a
+        dequeue operation. Only used if `shuffle` is true.
+      shuffle: whether records should be shuffled. Defaults to true.
+      seed: passed to random shuffle operations. Only used if `shuffle` is true.
+
+    Returns:
+      A `DataFrame` that has columns corresponding to `features` and is filled
+      with examples from `filepatterns`.
+
+    Raises:
+      ValueError: no files match `filepatterns`.
+      ValueError: `features` contains the reserved name 'index'.
+    """
+
+    def get_default_values(column_names):
+      return [_get_default_value(feature_spec[name]) for name in column_names]
+
+    dataframe = cls._from_csv_base(filepatterns, get_default_values, has_header,
+                                   column_names, num_threads,
+                                   enqueue_size, batch_size, queue_capacity,
+                                   min_after_dequeue, shuffle, seed)
+
+    # replace the dense columns with sparse ones in place in the dataframe
+    for name in dataframe.columns():
+      if name != "index" and isinstance(feature_spec[name],
+                                        parsing_ops.VarLenFeature):
+        strip_value = _get_default_value(feature_spec[name])
+        (dataframe[name],) = sparsify.Sparsify(strip_value)(dataframe[name])
+
+    return dataframe
+
+  @classmethod
   def from_examples(cls,
                     filepatterns,
                     features,
                     reader_cls=io_ops.TFRecordReader,
-                    num_epochs=None,
                     num_threads=1,
                     enqueue_size=None,
                     batch_size=32,
@@ -255,9 +457,6 @@ class TensorFlowDataFrame(df.DataFrame):
         `FixedLenFeature`.
       reader_cls: a subclass of `tensorflow.ReaderBase` that will be used to
         read the `Example`s.
-      num_epochs: the number of times that the reader should loop through all
-        the file names. If set to `None`, then the reader will continue
-        indefinitely.
       num_threads: the number of readers that will work in parallel.
       enqueue_size: block size for each read operation.
       batch_size: desired batch size.
@@ -288,7 +487,6 @@ class TensorFlowDataFrame(df.DataFrame):
         filenames,
         enqueue_size=enqueue_size,
         batch_size=batch_size,
-        num_epochs=num_epochs,
         queue_capacity=queue_capacity,
         shuffle=shuffle,
         min_after_dequeue=min_after_dequeue,

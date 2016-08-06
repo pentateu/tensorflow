@@ -252,7 +252,8 @@ class FunctionCallFrame {
 class FunctionLibraryDefinition : public OpRegistryInterface {
  public:
   explicit FunctionLibraryDefinition(const FunctionLibraryDefinition& lib_def);
-  explicit FunctionLibraryDefinition(const FunctionDefLibrary& lib_def);
+  FunctionLibraryDefinition(const OpRegistryInterface* default_registry,
+                            const FunctionDefLibrary& lib_def);
   ~FunctionLibraryDefinition() override;
 
   FunctionLibraryDefinition& operator=(const FunctionLibraryDefinition&) =
@@ -294,6 +295,7 @@ class FunctionLibraryDefinition : public OpRegistryInterface {
     OpRegistrationData op_registration_data;
   };
 
+  const OpRegistryInterface* const default_registry_;
   std::unordered_map<string, std::unique_ptr<FunctionDefAndOpRegistration>>
       function_defs_;
   std::unordered_map<string, string> func_grad_;
@@ -358,6 +360,10 @@ class FunctionLibraryRuntime {
 
   // Return the device on which the function executes.
   virtual Device* device() = 0;
+
+  // Returns the function library definition that backs this runtime.
+  virtual const FunctionLibraryDefinition* GetFunctionLibraryDefinition()
+      const = 0;
 };
 
 // To register a gradient function for a builtin op, one should use

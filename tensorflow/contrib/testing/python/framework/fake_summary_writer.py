@@ -1,4 +1,3 @@
-# pylint: disable=g-bad-file-header
 # Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -49,6 +48,10 @@ class FakeSummaryWriter(object):
     self._added_graphs = []
     self._added_session_logs = []
 
+  @property
+  def summaries(self):
+    return self._summaries
+
   def assert_summaries(
       self, test_case, expected_logdir=None, expected_graph=None,
       expected_summaries=None, expected_added_graphs=None,
@@ -71,9 +74,10 @@ class FakeSummaryWriter(object):
           if 'global_step/sec' != v.tag:
             actual_simple_values[v.tag] = v.simple_value
       test_case.assertEqual(expected_summaries[step], actual_simple_values)
-    test_case.assertEqual(expected_added_graphs or [], self._added_graphs)
-    test_case.assertEqual(
-        expected_session_logs or [], self._added_session_logs)
+    if expected_added_graphs is not None:
+      test_case.assertEqual(expected_added_graphs, self._added_graphs)
+    if expected_session_logs is not None:
+      test_case.assertEqual(expected_session_logs, self._added_session_logs)
 
   def add_summary(self, summary, current_global_step):
     """Add summary."""

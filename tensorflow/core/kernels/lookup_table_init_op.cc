@@ -80,7 +80,7 @@ class KeyValueTensorIterator
 
   Status status() const override { return status_; }
 
-  int64 total_size() const {
+  int64 total_size() const override {
     return keys_ == nullptr ? -1 : keys_->NumElements();
   }
 
@@ -95,11 +95,10 @@ class KeyValueTensorIterator
 
 Status GetNumLinesInTextFile(Env* env, const string& vocab_file,
                              int64* num_lines) {
-  RandomAccessFile* file;
+  std::unique_ptr<RandomAccessFile> file;
   TF_RETURN_IF_ERROR(env->NewRandomAccessFile(vocab_file, &file));
-  std::unique_ptr<RandomAccessFile> deleter(file);
 
-  io::InputBuffer input_buffer(file, kInputBufferSize);
+  io::InputBuffer input_buffer(file.get(), kInputBufferSize);
   string line;
   Status s = input_buffer.ReadLine(&line);
   int64 next_id = 0;
@@ -152,10 +151,8 @@ class TextFileLineIterator
     key_index_ = key_index;
     value_index_ = value_index;
 
-    RandomAccessFile* file;
-    status_ = env->NewRandomAccessFile(filename_, &file);
+    status_ = env->NewRandomAccessFile(filename_, &file_);
     if (!status_.ok()) return status_;
-    file_.reset(file);
 
     input_buffer_.reset(new io::InputBuffer(file_.get(), kInputBufferSize));
     valid_ = true;
